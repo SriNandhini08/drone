@@ -1,0 +1,456 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Drone Simulator</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;overflow:hidden;font-family:Arial,sans-serif;background:#e8edf0;color:#202830}
+#scene{position:fixed;inset:0}
+#topbar{position:fixed;z-index:2;top:12px;left:12px;right:12px;background:#ffffffed;border:1px solid #d3d9de;border-radius:7px;padding:15px 20px;display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap}
+.metric{font-weight:bold}.metric span{font-weight:normal}
+#mode{padding:9px 13px;background:#d9f4e3;color:#17623b;border-radius:5px}
+#controls{position:fixed;z-index:2;left:12px;bottom:12px;width:320px;max-width:calc(100vw - 24px);padding:15px;background:#ffffffed;border:1px solid #d3d9de;border-radius:7px}
+h3{margin:0 0 12px}
+.control{display:grid;grid-template-columns:55px 1fr 45px;gap:8px;align-items:center;margin:12px 0;font-size:13px}
+input[type=range]{width:100%;accent-color:#168348}
+button{padding:9px 12px;margin:5px 4px 0 0;background:white;border:1px solid #cbd3da;border-radius:5px;cursor:pointer}
+button.primary{background:#177c49;color:white}
+#status{margin-top:10px;font-size:12px;line-height:1.5;color:#596570}
+#help{position:fixed;right:12px;bottom:12px;z-index:2;padding:12px 15px;background:#ffffffed;border:1px solid #d3d9de;border-radius:6px;font-size:12px;line-height:1.8}
+@media(max-width:650px){#help{display:none}#topbar{gap:10px}}
+</style>
+</head>
+<body>
+<div id="scene"></div>
+
+<div id="topbar">
+  <div class="metric">Roll: <span id="rollRead">0.0°</span></div>
+  <div class="metric">Pitch: <span id="pitchRead">0.0°</span></div>
+  <div class="metric">Yaw: <span id="yawRead">0.0°</span></div>
+  <div id="mode">Simulation Mode</div>
+</div>
+
+<div id="controls">
+  <h3>Drone Controls</h3>
+  <div class="control"><label for="roll">Roll</label><input id="roll" type="range" min="-35" max="35" value="0"><span id="rollVal">0°</span></div>
+  <div class="control"><label for="pitch">Pitch</label><input id="pitch" type="range" min="-35" max="35" value="0"><span id="pitchVal">0°</span></div>
+  <div class="control"><label for="yaw">Yaw</label><input id="yaw" type="range" min="-180" max="180" value="0"><span id="yawVal">0°</span></div>
+  <div class="control"><label for="height">Height</label><input id="height" type="range" min="0" max="4" step="0.1" value="1.2"><span id="heightVal">1.2 m</span></div>
+  <button id="connect" class="primary">Connect ESP32 USB</button>
+  <button id="reset">Reset</button>
+  <div id="status">Simulation ready. Use the sliders or keyboard controls.</div>
+</div>
+
+<div id="help">
+<b>Keyboard Controls</b><br>
+A / D — Roll<br>
+W / S — Pitch<br>
+Q / E — Yaw<br>
+↑ / ↓ — Height<br>
+R — Reset
+</div>
+
+<script type="module">
+import * as THREE from
+'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+// ---------- SCENE ----------
+
+const host = document.getElementById('scene');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xe8edf0);
+
+const camera = new THREE.PerspectiveCamera(
+  42, innerWidth / innerHeight, 0.1, 100
+);
+camera.position.set(7, 7, 9);
+camera.lookAt(0, 1, 0);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+host.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x727983, 2));
+
+const sun = new THREE.DirectionalLight(0xffffff, 2.4);
+sun.position.set(5, 10, 7);
+sun.castShadow = true;
+scene.add(sun);
+
+// ---------- GROUND GRID ----------
+
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(200, 200),
+  new THREE.MeshStandardMaterial({color:0xe8edf0,roughness:1})
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.04;
+floor.receiveShadow = true;
+scene.add(floor);
+
+const grid = new THREE.GridHelper(40, 40, 0xb8c1c9, 0xcbd2d9);
+grid.position.y = 0;
+scene.add(grid);
+
+// ---------- MATERIALS ----------
+
+const frameMat = new THREE.MeshStandardMaterial({
+  color:0x252a2f, metalness:0.35, roughness:0.55
+});
+const plateMat = new THREE.MeshStandardMaterial({
+  color:0x30353a, metalness:0.25, roughness:0.62
+});
+const motorMat = new THREE.MeshStandardMaterial({
+  color:0x15181b, metalness:0.35, roughness:0.5
+});
+const blueMat = new THREE.MeshStandardMaterial({
+  color:0x075ed8, metalness:0.4, roughness:0.35
+});
+const greenMat = new THREE.MeshStandardMaterial({
+  color:0x35dc51, side:THREE.DoubleSide, roughness:0.45
+});
+
+// ---------- MODEL HELPERS ----------
+
+const drone = new THREE.Group();
+scene.add(drone);
+
+function box(parent, sx, sy, sz, x, y, z, mat) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx,sy,sz),mat);
+  mesh.position.set(x,y,z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  parent.add(mesh);
+  return mesh;
+}
+
+function cylinder(parent, rt, rb, h, x, y, z, mat, segments=32) {
+  const mesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(rt,rb,h,segments),mat
+  );
+  mesh.position.set(x,y,z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  parent.add(mesh);
+  return mesh;
+}
+
+// ---------- CENTRAL FLIGHT FRAME ----------
+
+// Layered central plate with clipped corners
+function makePlate(width, depth, thickness, cut, y, material) {
+  const s = new THREE.Shape();
+  s.moveTo(-width/2+cut,-depth/2);
+  s.lineTo(width/2-cut,-depth/2);
+  s.lineTo(width/2,-depth/2+cut);
+  s.lineTo(width/2,depth/2-cut);
+  s.lineTo(width/2-cut,depth/2);
+  s.lineTo(-width/2+cut,depth/2);
+  s.lineTo(-width/2,depth/2-cut);
+  s.lineTo(-width/2,-depth/2+cut);
+  s.closePath();
+
+  const geometry = new THREE.ExtrudeGeometry(s,{
+    depth:thickness, bevelEnabled:false
+  });
+  const mesh = new THREE.Mesh(geometry,material);
+  mesh.rotation.x = -Math.PI/2;
+  mesh.position.y = y;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  drone.add(mesh);
+  return mesh;
+}
+
+makePlate(1.32,1.18,0.12,0.16,-0.06,frameMat);
+makePlate(1.18,1.04,0.045,0.13,0.065,plateMat);
+
+// Visible central top panel
+box(drone,0.70,0.025,0.56,0,0.145,0,plateMat);
+
+// Small screw heads around the plate
+const screwMat = new THREE.MeshStandardMaterial({
+  color:0xb8bec3,metalness:0.8,roughness:0.3
+});
+
+for (const x of [-0.48,0.48]) {
+  for (const z of [-0.40,0.40]) {
+    cylinder(drone,0.035,0.035,0.012,x,0.105,z,screwMat,12);
+    box(drone,0.035,0.004,0.006,x,0.113,z,frameMat);
+  }
+}
+
+// ---------- FOUR ARMS AND MOTORS ----------
+
+const motorPositions = [
+  {x:-1.85,z:-1.55},
+  {x: 1.85,z:-1.55},
+  {x:-1.85,z: 1.55},
+  {x: 1.85,z: 1.55}
+];
+
+const propellers = [];
+
+motorPositions.forEach((p,index) => {
+  // Arm runs along local Z, rotated to the motor location
+  const armAngle = Math.atan2(p.x,p.z);
+  const armLength = Math.hypot(p.x,p.z) - 0.40;
+
+  const arm = box(
+    drone,0.19,0.14,armLength,
+    p.x/2,0,p.z/2,frameMat
+  );
+  arm.rotation.y = armAngle;
+
+  // Motor base
+  cylinder(drone,0.29,0.29,0.13,
+    p.x,0.09,p.z,frameMat);
+
+  // Black motor casing
+  cylinder(drone,0.245,0.245,0.27,
+    p.x,0.27,p.z,motorMat);
+
+  // Distinct blue motor collar
+  cylinder(drone,0.255,0.255,0.12,
+    p.x,0.42,p.z,blueMat);
+
+  // Black motor top
+  cylinder(drone,0.145,0.145,0.075,
+    p.x,0.51,p.z,motorMat);
+
+  // Propeller hub
+  cylinder(drone,0.07,0.07,0.06,
+    p.x,0.57,p.z,frameMat);
+
+  const prop = new THREE.Group();
+  prop.position.set(p.x,0.61,p.z);
+  drone.add(prop);
+
+  // Two broad opposing green blades, in the horizontal plane
+  for (const sign of [-1,1]) {
+    const blade = new THREE.Mesh(
+      new THREE.BoxGeometry(1.10,0.035,0.17),
+      greenMat
+    );
+    blade.position.x = sign * 0.56;
+    blade.rotation.y = sign * 0.055;
+    blade.castShadow = true;
+    prop.add(blade);
+  }
+
+  // Green center collar
+  cylinder(prop,0.09,0.09,0.045,
+    0,0.035,0,greenMat);
+
+  // Small black shaft cap
+  cylinder(prop,0.045,0.045,0.055,
+    0,0.075,0,motorMat,20);
+
+  propellers.push(prop);
+});
+
+// ---------- LANDING GEAR ----------
+
+for (const x of [-0.62,0.62]) {
+  for (const z of [-0.38,0.38]) {
+    box(drone,0.075,0.38,0.075,x,-0.25,z,motorMat);
+  }
+}
+
+box(drone,0.09,0.07,1.45,-0.62,-0.46,0,frameMat);
+box(drone,0.09,0.07,1.45, 0.62,-0.46,0,frameMat);
+
+drone.position.set(0,1.2,0);
+
+// ---------- CONTROL STATE ----------
+
+const state = {roll:0,pitch:0,yaw:0,height:1.2};
+const names = ['roll','pitch','yaw','height'];
+
+let hardwareMode = false;
+let port = null;
+let reader = null;
+let reading = false;
+
+const status = document.getElementById('status');
+const connectButton = document.getElementById('connect');
+const modeLabel = document.getElementById('mode');
+
+function updateUI() {
+  names.forEach(name => {
+    document.getElementById(name).value = state[name];
+    document.getElementById(name+'Val').textContent =
+      name === 'height'
+        ? state[name].toFixed(1)+' m'
+        : Math.round(state[name])+'°';
+  });
+
+  document.getElementById('rollRead').textContent =
+    state.roll.toFixed(1)+'°';
+  document.getElementById('pitchRead').textContent =
+    state.pitch.toFixed(1)+'°';
+  document.getElementById('yawRead').textContent =
+    state.yaw.toFixed(1)+'°';
+}
+
+names.forEach(name => {
+  document.getElementById(name).addEventListener('input',event => {
+    if (hardwareMode) return;
+    state[name] = Number(event.target.value);
+    updateUI();
+  });
+});
+
+function resetDrone() {
+  Object.assign(state,{roll:0,pitch:0,yaw:0,height:1.2});
+  updateUI();
+}
+
+document.getElementById('reset').addEventListener('click',resetDrone);
+
+window.addEventListener('keydown',event => {
+  if (event.target instanceof HTMLInputElement) return;
+
+  const k = event.key.toLowerCase();
+  if (k==='a') state.roll=Math.max(-35,state.roll-2);
+  else if (k==='d') state.roll=Math.min(35,state.roll+2);
+  else if (k==='w') state.pitch=Math.max(-35,state.pitch-2);
+  else if (k==='s') state.pitch=Math.min(35,state.pitch+2);
+  else if (k==='q') state.yaw=Math.max(-180,state.yaw-4);
+  else if (k==='e') state.yaw=Math.min(180,state.yaw+4);
+  else if (k==='arrowup') state.height=Math.min(4,state.height+0.1);
+  else if (k==='arrowdown') state.height=Math.max(0,state.height-0.1);
+  else if (k==='r') resetDrone();
+  else return;
+
+  event.preventDefault();
+  updateUI();
+});
+
+// ---------- ESP32 USB SERIAL ----------
+// Expected input: roll,pitch,yaw
+// Example: 2.30,-1.20,10.50
+
+function parseLine(line) {
+  const v = line.trim().split(',').map(Number);
+  if (v.length<3 || !v.slice(0,3).every(Number.isFinite)) return;
+
+  state.roll = THREE.MathUtils.clamp(v[0],-35,35);
+  state.pitch = THREE.MathUtils.clamp(v[1],-35,35);
+  state.yaw = THREE.MathUtils.euclideanModulo(v[2]+180,360)-180;
+  updateUI();
+}
+
+connectButton.addEventListener('click',async () => {
+  if (!('serial' in navigator)) {
+    status.textContent='Use Chrome or Edge at http://localhost:8000.';
+    return;
+  }
+
+  if (hardwareMode) {
+    reading = false;
+    try {
+      if (reader) await reader.cancel();
+    } catch {}
+    return;
+  }
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+
+    hardwareMode = true;
+    reading = true;
+    connectButton.textContent='Disconnect ESP32';
+    modeLabel.textContent='ESP32 Connected';
+    status.textContent='Connected. Keep the sensor still during startup calibration.';
+
+    const decoder = new TextDecoderStream();
+    const pipeClosed = port.readable.pipeTo(decoder.writable);
+    reader = decoder.readable.getReader();
+
+    let buffer = '';
+
+    while (reading) {
+      const result = await reader.read();
+      if (result.done) break;
+
+      buffer += result.value;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      lines.forEach(parseLine);
+    }
+
+    reader.releaseLock();
+    reader = null;
+    await pipeClosed.catch(()=>{});
+    await port.close();
+    port = null;
+
+  } catch (error) {
+    status.textContent='USB error: '+error.message+
+      '. Close Arduino Serial Monitor and retry.';
+  } finally {
+    hardwareMode=false;
+    reading=false;
+    connectButton.textContent='Connect ESP32 USB';
+    modeLabel.textContent='Simulation Mode';
+
+    if (port) {
+      try {
+        if (reader) reader.releaseLock();
+        await port.close();
+      } catch {}
+    }
+    reader=null;
+    port=null;
+  }
+});
+
+// ---------- ANIMATION ----------
+
+const rad = Math.PI/180;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  drone.rotation.z = THREE.MathUtils.damp(
+    drone.rotation.z,-state.roll*rad,5,1/60
+  );
+
+  drone.rotation.x = THREE.MathUtils.damp(
+    drone.rotation.x,state.pitch*rad,5,1/60
+  );
+
+  drone.rotation.y = THREE.MathUtils.damp(
+    drone.rotation.y,state.yaw*rad,5,1/60
+  );
+
+  drone.position.y = THREE.MathUtils.damp(
+    drone.position.y,state.height,4,1/60
+  );
+
+  propellers.forEach((prop,i) => {
+    prop.rotation.y += i%2===0 ? 0.20 : -0.20;
+  });
+
+  renderer.render(scene,camera);
+}
+
+window.addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+updateUI();
+animate();
+</script>
+</body>
+</html>
